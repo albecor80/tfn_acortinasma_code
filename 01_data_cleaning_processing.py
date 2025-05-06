@@ -4,6 +4,7 @@ import pyarrow.parquet as pq
 # import pandas as pd # No longer needed
 # from utils import load_parquet_file # No longer needed directly in filter function
 import config
+import gc  # For garbage collection
 
 def filter_sales_by_not_type(table: pa.Table, types: list[str]) -> pa.Table:
     """
@@ -182,7 +183,8 @@ def process_data(initial_table: pa.Table, processing_functions: list,
                show_intermediate: bool = False,
                save_result: bool = False,
                output_path: str = None,
-               output_compression: str = 'snappy') -> pa.Table:
+               output_compression: str = 'snappy',
+               memory_limit: str = '4GB') -> pa.Table:
     """
     Apply a list of processing functions to a PyArrow table in sequence.
     
@@ -196,6 +198,7 @@ def process_data(initial_table: pa.Table, processing_functions: list,
         save_result: Whether to save the final result as a Parquet file
         output_path: Path where to save the Parquet file (required if save_result=True)
         output_compression: Compression algorithm to use (default: 'snappy')
+        memory_limit: Memory limit for DuckDB operations (default: '4GB')
     
     Returns:
         The final PyArrow table after all processing steps
@@ -206,6 +209,7 @@ def process_data(initial_table: pa.Table, processing_functions: list,
     con = None
     if show_intermediate:
         con = duckdb.connect()
+        con.execute(f"PRAGMA memory_limit='{memory_limit}'")
     
     try:
         # Apply each function in the list
@@ -236,12 +240,21 @@ def process_data(initial_table: pa.Table, processing_functions: list,
             # Apply the function with current_table as first arg
             current_table = function(current_table, *args, **kwargs)
             
+            # Force garbage collection after each step to free memory
+            gc.collect()
+            
             if show_intermediate:
                 print(f"Rows after: {len(current_table):,}")
                 # Show first few rows
-                con.register('current_table', current_table)
-                print(f"\nSample after {function_name} (first 5 rows):")
-                con.sql("SELECT * FROM current_table LIMIT 5").show()
+                if con:
+                    con.register('current_table', current_table)
+                    print(f"\nSample after {function_name} (first 5 rows):")
+                    con.sql("SELECT * FROM current_table LIMIT 5").show()
+                    
+                    # Reset DuckDB connection to free memory
+                    con.close()
+                    con = duckdb.connect()
+                    con.execute(f"PRAGMA memory_limit='{memory_limit}'")
         
         # Save the result if requested
         if save_result:
@@ -249,7 +262,61 @@ def process_data(initial_table: pa.Table, processing_functions: list,
                 raise ValueError("output_path must be specified when save_result=True")
             
             print(f"\nSaving result to {output_path}")
-            pq.write_table(current_table, output_path, compression=output_compression)
+            # Use chunked writing for large tables
+            if len(current_table) > 1000000:  # If table is large
+                print("Using chunked writing for large table...")
+                # For large tables, we'll split the table into chunks
+                import os
+                from pathlib import Path
+                
+                # Create a temporary directory for chunks
+                temp_dir = Path(output_path).parent / f"temp_{Path(output_path).stem}"
+                os.makedirs(temp_dir, exist_ok=True)
+                
+                # Write chunks to individual files
+                chunk_size = 250000
+                num_chunks = (len(current_table) + chunk_size - 1) // chunk_size  # Ceiling division
+                
+                for i in range(num_chunks):
+                    start_idx = i * chunk_size
+                    end_idx = min((i + 1) * chunk_size, len(current_table))
+                    
+                    # Extract chunk
+                    chunk = current_table.slice(start_idx, end_idx - start_idx)
+                    
+                    # Write to temp file
+                    chunk_path = temp_dir / f"chunk_{i}.parquet"
+                    pq.write_table(chunk, chunk_path, compression=output_compression)
+                    print(f"  - Saved chunk {i+1}/{num_chunks} to {chunk_path}")
+                    
+                    # Release memory
+                    del chunk
+                    gc.collect()
+                
+                # Merge chunks into final file
+                print(f"Merging {num_chunks} chunks into final file...")
+                
+                # Read and concatenate all chunks
+                chunk_files = sorted(temp_dir.glob("chunk_*.parquet"))
+                tables = []
+                
+                for chunk_file in chunk_files:
+                    tables.append(pq.read_table(chunk_file))
+                
+                # Write concatenated table to final path
+                merged_table = pa.concat_tables(tables)
+                pq.write_table(merged_table, output_path, compression=output_compression)
+                
+                # Clean up temporary files
+                for chunk_file in chunk_files:
+                    os.remove(chunk_file)
+                os.rmdir(temp_dir)
+                
+                print(f"Successfully merged chunks and cleaned up temporary files")
+            else:
+                # Use standard PyArrow writing for smaller tables
+                pq.write_table(current_table, output_path, compression=output_compression)
+            
             print(f"Saved {len(current_table):,} rows to {output_path}")
         
         return current_table
@@ -258,6 +325,9 @@ def process_data(initial_table: pa.Table, processing_functions: list,
         # Close the connection if it was created
         if con:
             con.close()
+        
+        # Final garbage collection
+        gc.collect()
 
 def group_by_week(table: pa.Table) -> pa.Table:
     """
@@ -343,79 +413,137 @@ def fill_time_series_gaps(table: pa.Table) -> pa.Table:
     Fill gaps in time series data for each store-product combination.
     For each combination, generates rows for any missing weeks between min and max date.
     
+    Processes data in smaller chunks to avoid memory issues.
+    
     Args:
         table: Input PyArrow table with 'week' column and store-product identifiers
     
     Returns:
         PyArrow table with continuous weekly data, filling missing weeks with NULL values
     """
-    con = duckdb.connect() # Create temporary connection
+    import pyarrow as pa
+    import pandas as pd
+    from tqdm import tqdm
+    
+    # Create a DuckDB connection with memory limits
+    con = duckdb.connect()
+    con.execute("PRAGMA memory_limit='4GB'")  # Limit DuckDB memory usage
+    
     try:
-        # Register the PyArrow table with DuckDB
+        # Register the input table
         con.register('input_table', table)
         
-        # This query:
-        # 1. Finds min and max weeks for each store-product combination
-        # 2. Generates a continuous sequence of weeks for each combination
-        # 3. Left joins with original data to get metrics where available
-        # 4. Fills NULL with 0 for numeric columns and appropriate values for flags
-        query = """
-            WITH 
-            -- Get min and max week for each store-product combination
-            date_ranges AS (
-                SELECT 
-                    establecimiento,
-                    material,
-                    MIN(week) AS min_week,
-                    MAX(week) AS max_week
-                FROM input_table
-                GROUP BY establecimiento, material
-            ),
+        # Get unique store-product combinations
+        combinations = con.execute("""
+            SELECT DISTINCT establecimiento, material 
+            FROM input_table
+            ORDER BY establecimiento, material
+        """).fetchall()
+        
+        print(f"Processing {len(combinations)} unique store-product combinations in batches")
+        
+        # Process in smaller batches to avoid memory issues
+        batch_size = 500  # Adjust based on memory constraints
+        all_results = []
+        
+        # Process in batches
+        for i in range(0, len(combinations), batch_size):
+            batch = combinations[i:i+batch_size]
+            batch_conditions = []
             
-            -- Generate all weeks between min and max for each combination
-            all_weeks AS (
-                SELECT 
-                    d.establecimiento,
-                    d.material,
-                    -- Cast GENERATE_SERIES result to DATE explicitly
-                    calendar_value::DATE AS week
-                FROM date_ranges d,
-                LATERAL UNNEST(
-                    GENERATE_SERIES(
-                        d.min_week, 
-                        d.max_week, 
-                        INTERVAL '1 week'
-                    )
-                ) AS t(calendar_value)
-            )
+            # Build WHERE conditions for the current batch
+            for estab, mat in batch:
+                batch_conditions.append(f"(establecimiento = '{estab}' AND material = '{mat}')")
             
-            -- Join with original data to get metrics where available
-            SELECT 
-                a.establecimiento,
-                a.material,
-                a.week,
-                COALESCE(o.has_promo, 0) AS has_promo,
-                COALESCE(o.weekly_volume, 0) AS weekly_volume,
-                COALESCE(o.is_covid_period, 
-                    CASE 
-                        WHEN a.week BETWEEN '2020-03-01' AND '2022-04-30' THEN 1
-                        ELSE 0
-                    END
-                ) AS is_covid_period
-            FROM all_weeks a
-            LEFT JOIN input_table o
-                ON a.establecimiento = o.establecimiento
-                AND a.material = o.material
-                AND a.week = o.week
-            ORDER BY 
-                a.establecimiento,
-                a.material,
-                a.week
-        """
-        result_table = con.sql(query).fetch_arrow_table()
+            # Process this batch
+            where_clause = " OR ".join(batch_conditions)
+            
+            # This query:
+            # 1. Finds min and max weeks for each store-product combination in the batch
+            # 2. Generates a continuous sequence of weeks for each combination
+            # 3. Left joins with original data to get metrics where available
+            # 4. Fills NULL with 0 for numeric columns and appropriate values for flags
+            batch_query = f"""
+                WITH 
+                -- Get min and max week for each store-product in this batch
+                date_ranges AS (
+                    SELECT 
+                        establecimiento,
+                        material,
+                        MIN(week) AS min_week,
+                        MAX(week) AS max_week
+                    FROM input_table
+                    WHERE {where_clause}
+                    GROUP BY establecimiento, material
+                ),
+                
+                -- Generate all weeks between min and max for each combination
+                all_weeks AS (
+                    SELECT 
+                        d.establecimiento,
+                        d.material,
+                        -- Cast GENERATE_SERIES result to DATE explicitly
+                        calendar_value::DATE AS week
+                    FROM date_ranges d,
+                    LATERAL UNNEST(
+                        GENERATE_SERIES(
+                            d.min_week, 
+                            d.max_week, 
+                            INTERVAL '1 week'
+                        )
+                    ) AS t(calendar_value)
+                )
+                
+                -- Join with original data to get metrics where available
+                SELECT 
+                    a.establecimiento,
+                    a.material,
+                    a.week,
+                    COALESCE(o.has_promo, 0) AS has_promo,
+                    COALESCE(o.weekly_volume, 0) AS weekly_volume,
+                    COALESCE(o.is_covid_period, 
+                        CASE 
+                            WHEN a.week BETWEEN '2020-03-01' AND '2022-04-30' THEN 1
+                            ELSE 0
+                        END
+                    ) AS is_covid_period
+                FROM all_weeks a
+                LEFT JOIN input_table o
+                    ON a.establecimiento = o.establecimiento
+                    AND a.material = o.material
+                    AND a.week = o.week
+                ORDER BY 
+                    a.establecimiento,
+                    a.material,
+                    a.week
+            """
+            
+            # Execute query and collect results
+            print(f"Processing batch {i//batch_size + 1}/{(len(combinations)-1)//batch_size + 1} " +
+                  f"(items {i+1}-{min(i+batch_size, len(combinations))})")
+            
+            batch_result = con.execute(batch_query).fetch_arrow_table()
+            all_results.append(batch_result)
+            
+            # Force memory cleanup
+            # Close and reopen connection to clear memory between batches
+            con.close()
+            con = duckdb.connect()
+            con.execute("PRAGMA memory_limit='4GB'")
+            con.register('input_table', table)
+            
+            # Also force Python garbage collection
+            gc.collect()
+            
+        # Combine all batches into one table
+        if len(all_results) == 1:
+            result_table = all_results[0]
+        else:
+            result_table = pa.concat_tables(all_results)
+            
+        return result_table
     finally:
-        con.close() # Ensure connection is closed
-    return result_table
+        con.close()  # Ensure connection is closed
 
 def sort_series_by_volume(table: pa.Table) -> pa.Table:
     """
@@ -428,6 +556,8 @@ def sort_series_by_volume(table: pa.Table) -> pa.Table:
         PyArrow table sorted by total volume of each series (establecimiento-material pair)
     """
     con = duckdb.connect() # Create temporary connection
+    con.execute("PRAGMA memory_limit='4GB'")  # Limit DuckDB memory usage
+    
     try:
         # Register the PyArrow table with DuckDB
         con.register('input_table', table)
@@ -454,9 +584,84 @@ def sort_series_by_volume(table: pa.Table) -> pa.Table:
                 t.material,
                 t.week                -- Maintain time order within each series
         """
-        result_table = con.sql(query).fetch_arrow_table()
+        
+        # For very large tables, process in batches
+        if table.num_rows > 1000000:
+            # Get the unique combinations and their total volumes
+            totals_df = con.execute("""
+                SELECT 
+                    establecimiento,
+                    material,
+                    SUM(weekly_volume) AS total_volume
+                FROM input_table
+                GROUP BY establecimiento, material
+                ORDER BY SUM(weekly_volume) DESC
+            """).fetchdf()
+            
+            # Process in batches of combinations
+            batch_size = 500
+            all_results = []
+            
+            for i in range(0, len(totals_df), batch_size):
+                batch_df = totals_df.iloc[i:i+batch_size]
+                estabs = [f"'{e}'" for e in batch_df['establecimiento']]
+                mats = [f"'{m}'" for m in batch_df['material']]
+                
+                batch_conditions = []
+                for idx in range(len(batch_df)):
+                    e = batch_df.iloc[idx]['establecimiento']
+                    m = batch_df.iloc[idx]['material']
+                    batch_conditions.append(f"(establecimiento = '{e}' AND material = '{m}')")
+                
+                where_clause = " OR ".join(batch_conditions)
+                
+                batch_query = f"""
+                    WITH series_totals AS (
+                        SELECT 
+                            establecimiento,
+                            material,
+                            SUM(weekly_volume) AS total_volume
+                        FROM input_table
+                        WHERE {where_clause}
+                        GROUP BY establecimiento, material
+                    )
+                    SELECT t.*
+                    FROM input_table t
+                    JOIN series_totals s
+                        ON t.establecimiento = s.establecimiento 
+                        AND t.material = s.material
+                    ORDER BY 
+                        s.total_volume DESC,
+                        t.establecimiento,
+                        t.material,
+                        t.week
+                """
+                
+                print(f"Processing sort batch {i//batch_size + 1}/{(len(totals_df)-1)//batch_size + 1}")
+                batch_result = con.execute(batch_query).fetch_arrow_table()
+                all_results.append(batch_result)
+                
+                # Force memory cleanup
+                # Close and reopen connection to clear memory between batches
+                con.close()
+                con = duckdb.connect()
+                con.execute("PRAGMA memory_limit='4GB'")
+                con.register('input_table', table)
+                
+                # Also force Python garbage collection
+                gc.collect()
+            
+            # Combine results
+            result_table = pa.concat_tables(all_results)
+        else:
+            # For smaller tables, process all at once
+            result_table = con.execute(query).fetch_arrow_table()
     finally:
         con.close() # Ensure connection is closed
+    
+    # Force garbage collection
+    gc.collect()
+    
     return result_table
 
 def create_nested_series_format(table: pa.Table, output_path: str = None) -> pa.Table:
@@ -478,45 +683,174 @@ def create_nested_series_format(table: pa.Table, output_path: str = None) -> pa.
     Returns:
         PyArrow table with nested series format
     """
-    con = duckdb.connect() # Create temporary connection
+    con = duckdb.connect()
+    con.execute("PRAGMA memory_limit='4GB'")  # Limit DuckDB memory usage
+    
     try:
         # Register the PyArrow table with DuckDB
         con.register('input_table', table)
         
-        # Use DuckDB's list_aggr and struct_pack to create nested structure
-        query = """
-            SELECT 
-                establecimiento,
-                material,
-                -- Create the nested series array with date-value pairs including flags
-                LIST(STRUCT_PACK(
-                    ds := week::VARCHAR, 
-                    y := weekly_volume,
-                    has_promo := has_promo,
-                    is_covid_period := is_covid_period
-                )) AS series,
-                -- Add a count of points for reference
-                COUNT(*) AS num_points,
-                -- Add total and average volume for quick reference
-                SUM(weekly_volume) AS total_volume,
-                AVG(weekly_volume) AS avg_weekly_volume
-            FROM input_table
-            GROUP BY establecimiento, material
-            ORDER BY 
-                SUM(weekly_volume) DESC,  -- Sort by total volume
-                establecimiento,
-                material
-        """
-        result_table = con.sql(query).fetch_arrow_table()
+        # For large tables, process in batches by store-product combinations
+        if table.num_rows > 1000000:
+            print("Large table detected, processing nested series in batches...")
+            
+            # Get unique store-product combinations with their total volumes
+            combinations = con.execute("""
+                SELECT 
+                    establecimiento, 
+                    material,
+                    SUM(weekly_volume) AS total_volume
+                FROM input_table
+                GROUP BY establecimiento, material
+                ORDER BY 
+                    total_volume DESC,
+                    establecimiento, 
+                    material
+            """).fetchall()
+            
+            # Process in batches of combinations
+            batch_size = 500
+            all_results = []
+            
+            for i in range(0, len(combinations), batch_size):
+                batch = combinations[i:i+batch_size]
+                batch_conditions = []
+                
+                # Build WHERE conditions for the current batch
+                for estab, mat, _ in batch:
+                    batch_conditions.append(f"(establecimiento = '{estab}' AND material = '{mat}')")
+                
+                # Process this batch
+                where_clause = " OR ".join(batch_conditions)
+                
+                batch_query = f"""
+                    SELECT 
+                        establecimiento,
+                        material,
+                        -- Create the nested series array with date-value pairs including flags
+                        LIST(STRUCT_PACK(
+                            ds := week::VARCHAR, 
+                            y := weekly_volume,
+                            has_promo := has_promo,
+                            is_covid_period := is_covid_period
+                        )) AS series,
+                        -- Add a count of points for reference
+                        COUNT(*) AS num_points,
+                        -- Add total and average volume for quick reference
+                        SUM(weekly_volume) AS total_volume,
+                        AVG(weekly_volume) AS avg_weekly_volume
+                    FROM input_table
+                    WHERE {where_clause}
+                    GROUP BY establecimiento, material
+                    ORDER BY 
+                        SUM(weekly_volume) DESC,
+                        establecimiento,
+                        material
+                """
+                
+                print(f"Processing nested series batch {i//batch_size + 1}/{(len(combinations)-1)//batch_size + 1}")
+                batch_result = con.execute(batch_query).fetch_arrow_table()
+                all_results.append(batch_result)
+                
+                # Force memory cleanup
+                con.close()
+                con = duckdb.connect()
+                con.execute("PRAGMA memory_limit='4GB'")
+                con.register('input_table', table)
+                
+                # Force Python garbage collection
+                gc.collect()
+            
+            # Combine all batches
+            result_table = pa.concat_tables(all_results)
+        else:
+            # For smaller tables, process all at once using the original query
+            query = """
+                SELECT 
+                    establecimiento,
+                    material,
+                    -- Create the nested series array with date-value pairs including flags
+                    LIST(STRUCT_PACK(
+                        ds := week::VARCHAR, 
+                        y := weekly_volume,
+                        has_promo := has_promo,
+                        is_covid_period := is_covid_period
+                    )) AS series,
+                    -- Add a count of points for reference
+                    COUNT(*) AS num_points,
+                    -- Add total and average volume for quick reference
+                    SUM(weekly_volume) AS total_volume,
+                    AVG(weekly_volume) AS avg_weekly_volume
+                FROM input_table
+                GROUP BY establecimiento, material
+                ORDER BY 
+                    SUM(weekly_volume) DESC,  -- Sort by total volume
+                    establecimiento,
+                    material
+            """
+            result_table = con.execute(query).fetch_arrow_table()
         
         # Save to parquet if output_path provided
         if output_path:
             print(f"\nSaving nested series format to {output_path}")
-            pq.write_table(result_table, output_path)
+            # For large tables, write in chunks
+            if len(result_table) > 100000:
+                print("Large result table, writing in chunks...")
+                import os
+                from pathlib import Path
+                
+                # Create a temporary directory for chunks
+                temp_dir = Path(output_path).parent / f"temp_{Path(output_path).stem}"
+                os.makedirs(temp_dir, exist_ok=True)
+                
+                # Write chunks to individual files
+                chunk_size = 50000
+                num_chunks = (len(result_table) + chunk_size - 1) // chunk_size  # Ceiling division
+                
+                for i in range(num_chunks):
+                    start_idx = i * chunk_size
+                    end_idx = min((i + 1) * chunk_size, len(result_table))
+                    
+                    # Extract chunk
+                    chunk = result_table.slice(start_idx, end_idx - start_idx)
+                    
+                    # Write to temp file
+                    chunk_path = temp_dir / f"chunk_{i}.parquet"
+                    pq.write_table(chunk, chunk_path, compression='snappy')
+                    print(f"  - Saved chunk {i+1}/{num_chunks} to {chunk_path}")
+                    
+                    # Release memory
+                    del chunk
+                    gc.collect()
+                
+                # Merge chunks into final file
+                print(f"Merging {num_chunks} chunks into final file...")
+                
+                # Read and concatenate all chunks
+                chunk_files = sorted(temp_dir.glob("chunk_*.parquet"))
+                tables = []
+                
+                for chunk_file in chunk_files:
+                    tables.append(pq.read_table(chunk_file))
+                
+                # Write concatenated table to final path
+                merged_table = pa.concat_tables(tables)
+                pq.write_table(merged_table, output_path, compression='snappy')
+                
+                # Clean up temporary files
+                for chunk_file in chunk_files:
+                    os.remove(chunk_file)
+                os.rmdir(temp_dir)
+                
+                print(f"Successfully merged chunks and cleaned up temporary files")
+            else:
+                # Standard write for smaller tables
+                pq.write_table(result_table, output_path)
+                
             print(f"Saved {len(result_table):,} series to {output_path}")
             
             # Log a sample to show structure
-            sample = con.sql("""
+            sample = con.execute("""
                 SELECT 
                     establecimiento, 
                     material, 
@@ -526,11 +860,15 @@ def create_nested_series_format(table: pa.Table, output_path: str = None) -> pa.
                 LIMIT 1
             """).fetchall()
             
-            print("\nSample of nested structure:")
-            print(f"Series for {sample[0][0]}-{sample[0][1]} has {sample[0][2]} points")
-            print(f"First few points: {sample[0][3]}")
+            if sample:
+                print("\nSample of nested structure:")
+                print(f"Series for {sample[0][0]}-{sample[0][1]} has {sample[0][2]} points")
+                print(f"First few points: {sample[0][3]}")
     finally:
         con.close() # Ensure connection is closed
+    
+    # Final garbage collection
+    gc.collect()
     
     return result_table
 
@@ -554,8 +892,8 @@ def filter_by_materials(table: pa.Table) -> pa.Table:
         materials = list_materials_from_parquet(con, config.SILVER_VENTAS_PATH)
         
         # Filter materials by prefix
-        materials = [material for material in materials if material.startswith(('ED', 'FD', 'DL', 'BD', 'VD', 'VI'))]
-        
+        materials = [material for material in materials if material.startswith(('ED13', 'FD13', 'DL13', 'VI13', 'ED30', 'FD30', 'DL30', 'VI30', 'ED15', 'FD15', 'DL15', 'VI15' ))]
+
         # Register input table and run query
         con.register('input_table', table)
         query = f"""

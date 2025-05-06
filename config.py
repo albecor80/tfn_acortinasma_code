@@ -14,30 +14,20 @@ TIMESTAMP = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
 ROOT_DIR = Path(__file__).parent.parent.absolute()
 DATA_DIR = os.path.join(ROOT_DIR, "data")
 
-# Crear directorios si no existen
-os.makedirs(os.path.join(DATA_DIR, "raw"), exist_ok=True)
-os.makedirs(os.path.join(DATA_DIR, "bronze"), exist_ok=True)
-os.makedirs(os.path.join(DATA_DIR, "silver"), exist_ok=True)
-os.makedirs(os.path.join(DATA_DIR, "gold"), exist_ok=True)
-os.makedirs(os.path.join(DATA_DIR, "models"), exist_ok=True)
-os.makedirs(os.path.join(DATA_DIR, "results"), exist_ok=True)
-
 # Rutas de archivos
 SILVER_VENTAS_PATH = os.path.join(DATA_DIR, "silver", "ventas_silver.parquet")
 GOLD_DAILY_PATH = os.path.join(DATA_DIR, "gold", "ventas_daily.parquet")
 GOLD_WEEKLY_PATH = os.path.join(DATA_DIR, "gold", "ventas_weekly.parquet")
 GOLD_WEEKLY_TRAINING_PATH = os.path.join(DATA_DIR, "gold", "ventas_weekly_training.parquet")
-
+GOLD_WEEKLY_FULL_PATH = os.path.join(DATA_DIR, "ventas_weekly_full.parquet")
 # Ruta para modelos
-MODELS_DIR = os.path.join(DATA_DIR, "models")
+MODELS_DIR = os.path.join(ROOT_DIR, "models")
 PROPHET_MODELS_DIR = os.path.join(MODELS_DIR, "prophet")
 LIGHTGBM_MODELS_DIR = os.path.join(MODELS_DIR, "lightgbm")
 CLUSTER_RESULTS_DIR = os.path.join(DATA_DIR, "results", "clusters")
-
-# Crear directorios de modelos
-os.makedirs(PROPHET_MODELS_DIR, exist_ok=True)
-os.makedirs(LIGHTGBM_MODELS_DIR, exist_ok=True)
-os.makedirs(CLUSTER_RESULTS_DIR, exist_ok=True)
+STACKING_MODEL_DIR = os.path.join(MODELS_DIR, "stacking")
+GOLD_FEATURES_FULL_PATH = os.path.join(DATA_DIR, "features_full.parquet")
+os.makedirs(STACKING_MODEL_DIR, exist_ok=True)
 
 # Parámetros de procesamiento de datos
 TIPOS_A_EXCLUIR = ['E-COMMERCE', 'OTROS', 'KAM']
@@ -102,8 +92,10 @@ GOLD_WEEKLY_TRAINING_PATH = DATA_DIR / "gold_ventas_semanales_training.parquet"
 GOLD_WEEKLY_TRAINING_CLUSTERED_PATH = DATA_DIR / "gold_ventas_semanales_training_clustered.parquet"
 GOLD_FEATURES_PATH = DATA_DIR / "gold_features.parquet"
 GOLD_FEATURES_LGBM_PATH = DATA_DIR / "gold_features_lgbm.parquet"
+GOLD_FEATURES_LGBM_FULL_PATH = DATA_DIR / "gold_features_lgbm_full.parquet"
 LGBM_MODEL_OUTPUT_PATH = DATA_DIR / "models/lightgbm/lightgbm_final_model_hyperopt.pkl"
-
+RF_MODEL_OUTPUT_PATH = DATA_DIR / "models/rf/rf_final_model_hyperopt.pkl"
+RF_ENCODER_OUTPUT_PATH = DATA_DIR / "models/rf/rf_final_encoder"
 
 # Use relative paths from project root
 RAW_DATA_DIR = 'data/raw'
@@ -131,14 +123,6 @@ RESULTS_DIR = BASE_DIR / "results"
 for directory in [DATA_DIR, MODELS_DIR, RESULTS_DIR]:
     os.makedirs(directory, exist_ok=True)
 
-# Rutas específicas de datos
-RAW_DATA_PATH = DATA_DIR / "raw"
-PROCESSED_DATA_PATH = DATA_DIR / "processed"
-FEATURES_DATA_PATH = DATA_DIR / "features"
-
-# Crear subdirectorios de datos si no existen
-for directory in [RAW_DATA_PATH, PROCESSED_DATA_PATH, FEATURES_DATA_PATH]:
-    os.makedirs(directory, exist_ok=True)
 
 # Configuración para el procesamiento de datos
 DATA_PROCESSING = {

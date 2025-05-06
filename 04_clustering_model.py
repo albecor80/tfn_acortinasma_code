@@ -14,13 +14,11 @@ import pyarrow as pa
 warnings.simplefilter(action='ignore', category=FutureWarning)
 
 # --- 1. Cargar Datos desde Parquet ---
-parquet_file = config.GOLD_FEATURES_PATH # Asegúrate que el nombre sea correcto
+parquet_file = config.GOLD_FEATURES_FULL_PATH # Asegúrate que el nombre sea correcto
 
 
 def calculate_silhouette_score(features_table):
 
-    features_table = pq.read_table(parquet_file)
-    print(f"Datos cargados exitosamente desde {parquet_file}")
     print("Esquema de la tabla cargada:")
     print(features_table.schema)
 
@@ -289,7 +287,7 @@ def transpose_cluster_centroids():
     print("Generando tabla transpuesta de centroides...")
     
     # Cargar datos
-    features_table = pq.read_table(config.GOLD_FEATURES_PATH)
+    features_table = pq.read_table(config.GOLD_FEATURES_FULL_PATH)
     
     # Extraer nombres de features
     all_columns = features_table.schema.names
@@ -392,13 +390,13 @@ def assign_clusters_to_training_data(k: int):
     print("Asignando clusters a los datos de entrenamiento...")
     
     # 1. Cargar datos de entrenamiento
-    training_data = pq.read_table(config.GOLD_WEEKLY_TRAINING_PATH)
-    print(f"Datos de entrenamiento cargados desde {config.GOLD_WEEKLY_TRAINING_PATH}")
+    training_data = pq.read_table(config.GOLD_WEEKLY_FULL_PATH)
+    print(f"Datos de entrenamiento cargados desde {config.GOLD_WEEKLY_FULL_PATH}")
     print(f"Número de registros: {training_data.num_rows}")
     
     # 2. Cargar datos de features (que contienen los identificadores y las features para clustering)
-    features_table = pq.read_table(config.GOLD_FEATURES_PATH)
-    print(f"Datos de features cargados desde {config.GOLD_FEATURES_PATH}")
+    features_table = pq.read_table(config.GOLD_FEATURES_FULL_PATH)
+    print(f"Datos de features cargados desde {config.GOLD_FEATURES_FULL_PATH}")
     print(f"Número de registros: {features_table.num_rows}")
     
     # 3. Extraer identificadores y features para clustering
@@ -458,10 +456,50 @@ def assign_clusters_to_training_data(k: int):
     
     return output_path
 
+
 if __name__ == "__main__":
-    features_table = pq.read_table(config.GOLD_FEATURES_PATH)
+
+    print("--- INICIO DEL SCRIPT DE CLUSTERING ---")
+
+    # --- PASO 1: Determinar el número óptimo de clusters (k) ---
+    # Cargar los datos de features SOLO para este paso
+    print("\nCargando datos de features para análisis de k...")
+    try:
+        features_path = config.GOLD_FEATURES_FULL_PATH
+        features_table_for_k = pq.read_table(config.GOLD_FEATURES_FULL_PATH)
+
+        print(f"Datos cargados desde {features_path}")
+        # imprimir materiales unicos
+
+        # Llamar a la función que calcula y muestra las gráficas
+        calculate_silhouette_score(features_table_for_k)
+
+    except FileNotFoundError:
+        print(f"Error: No se encontró el archivo de features en {features_path}")
+        print("No se puede proceder con el análisis de k.")
+    except Exception as e:
+        print(f"Error durante el análisis de k: {e}")
+
+    # --- FIN DEL SCRIPT (en esta modificación) ---
+    # El código se detendrá aquí después de mostrar las gráficas.
+    # Para ejecutar los siguientes pasos (entrenamiento final, asignación),
+    # necesitarías:
+    # 1. Analizar las gráficas mostradas y ELEGIR un valor para 'k'.
+    # 2. Modificar este bloque __main__ o crear otro script para llamar a:
+    #    - train_clustering_model(features_table, k_elegido, transpose_view=True)
+    #    - assign_clusters_to_training_data(k_elegido)
+    #    (Asegúrate de cargar 'features_table' de nuevo si es necesario para esas funciones)
+
+    print("\n--- SCRIPT FINALIZADO ---")
+    print("Revisa las gráficas mostradas (Codo y Silueta) para elegir el valor óptimo de 'k'.")
+    print("Luego, modifica el script o ejecuta las funciones correspondientes")
+    print("con el 'k' elegido para entrenar el modelo final y/o asignar clusters.")
+
+'''
+if __name__ == "__main__":
+    features_table = pq.read_table(config.GOLD_FEATURES_FULL_PATH)
     # Modificar número de clusters si es necesario
-    k = 6
+    k = 7
     
     # Puedes descomentar una de estas funciones según lo que quieras hacer
     # Opción 1: Ejecutar clustering y generar vista transpuesta
@@ -469,3 +507,5 @@ if __name__ == "__main__":
     
     # Opción 2: Asignar clusters a los datos de entrenamiento
     assign_clusters_to_training_data(k)
+
+'''

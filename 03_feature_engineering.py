@@ -213,14 +213,14 @@ def feature_engineering_clustering(table_path: str):
 
 
     # Guardar como parquet file
-    pq.write_table(final_arrow_table, config.GOLD_FEATURES_PATH)
-    print(f"Saved features table to {config.GOLD_FEATURES_PATH}")
+    pq.write_table(final_arrow_table, config.GOLD_FEATURES_FULL_PATH)
+    print(f"Saved features table to {config.GOLD_FEATURES_FULL_PATH}")
 
     # Para asegurarnos que se guarda correctamente, comprobamos si el archivo existe
-    if os.path.exists(config.GOLD_FEATURES_PATH):
-        print(f"Confirmed: Features file exists at {config.GOLD_FEATURES_PATH}")
+    if os.path.exists(config.GOLD_FEATURES_FULL_PATH):
+        print(f"Confirmed: Features file exists at {config.GOLD_FEATURES_FULL_PATH}")
     else:
-        print(f"Warning: Features file was not created at {config.GOLD_FEATURES_PATH}")
+        print(f"Warning: Features file was not created at {config.GOLD_FEATURES_FULL_PATH}")
 
 
     return features_arrow_table
@@ -502,11 +502,12 @@ SELECT * FROM IntermittencyFeatures ORDER BY establecimiento, material, week;
         return None
 
 # --- Example Usage ---
+
+
 if __name__ == "__main__":
 
-
-
-    processed_table = feature_engineering_lightgbm(config.GOLD_WEEKLY_TRAINING_CLUSTERED_PATH)
+    # Use the appropriate weekly time series data instead of the features table
+    processed_table = feature_engineering_lightgbm(config.GOLD_FEATURES_FULL_PATH)
 
     if processed_table:
         print("\n--- Processed Table Sample (First 10 rows) ---")
@@ -516,3 +517,22 @@ if __name__ == "__main__":
         print(processed_table.schema)
     else:
         print("\nFeature engineering failed.")
+
+'''
+if __name__ == "__main__":
+
+    # Use the appropriate weekly time series data instead of the features table
+    print("Starting feature engineering clustering...")
+    print(config.GOLD_WEEKLY_FULL_PATH)
+    processed_table = feature_engineering_clustering(config.GOLD_WEEKLY_FULL_PATH)
+
+
+    if processed_table:
+        print("\n--- Processed Table Sample (First 10 rows) ---")
+        # Convert to Pandas just for easy printing of the head
+        print(processed_table.slice(0, 10).to_pandas())
+        print("\n--- Processed Table Schema ---")
+        print(processed_table.schema)
+    else:
+        print("\nFeature engineering failed.")
+'''
