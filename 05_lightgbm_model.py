@@ -7,105 +7,80 @@ from sklearn.metrics import mean_absolute_error, mean_squared_error, mean_absolu
 from sklearn.preprocessing import OneHotEncoder
 from sklearn.compose import ColumnTransformer
 from sklearn.pipeline import Pipeline
-from sklearn.impute import SimpleImputer # Usaremos imputer por si acaso
+from sklearn.impute import SimpleImputer
 import matplotlib.pyplot as plt
-import joblib # Para guardar modelos
+import joblib
 import os
-import gc # Garbage Collector
+import gc
 import warnings
 import lightgbm as lgb
 
-warnings.filterwarnings('ignore', category=FutureWarning) # Para limpiar la salida de sklearn/pandas
-warnings.filterwarnings('ignore', category=UserWarning) # Para limpiar la salida de sklearn/pandas
+warnings.filterwarnings('ignore', category=FutureWarning)
+warnings.filterwarnings('ignore', category=UserWarning)
 
-# --- 1. Configuración ---
 import config
-PARQUET_FILE = config.GOLD_FEATURES_LGBM_PATH # Asegúrate que la ruta sea correcta
-OUTPUT_DIR = 'rf_cluster_training_output_cl' # Directorio de salida cambiado
-METRICS_FILE = os.path.join(OUTPUT_DIR, 'all_cluster_metrics.csv') # Métricas por cluster
-PREDICTIONS_FILE = os.path.join(OUTPUT_DIR, 'all_series_predictions.csv') # Predicciones aún por serie
-PLOTS_DIR = os.path.join(OUTPUT_DIR, 'prediction_plots_by_series') # Plots por serie
-MODELS_DIR = os.path.join(OUTPUT_DIR, 'trained_cluster_models') # Modelos por cluster
+PARQUET_FILE = config.GOLD_FEATURES_LGBM_PATH
+OUTPUT_DIR = 'rf_cluster_training_output_cl'
+METRICS_FILE = os.path.join(OUTPUT_DIR, 'all_cluster_metrics.csv')
+PREDICTIONS_FILE = os.path.join(OUTPUT_DIR, 'all_series_predictions.csv')
+PLOTS_DIR = os.path.join(OUTPUT_DIR, 'prediction_plots_by_series')
+MODELS_DIR = os.path.join(OUTPUT_DIR, 'trained_cluster_models')
 
-# Crear directorios de salida si no existen
 os.makedirs(OUTPUT_DIR, exist_ok=True)
 os.makedirs(PLOTS_DIR, exist_ok=True)
 os.makedirs(MODELS_DIR, exist_ok=True)
 
 TARGET_VARIABLE = 'weekly_volume'
-SERIES_ID_COLS = ['establecimiento', 'material'] # Siguen siendo identificadores
+SERIES_ID_COLS = ['establecimiento', 'material']
 CLUSTER_COL = 'cluster_label'
 DATE_COL = 'week'
 
-# Leer columnas y definir features
 parquet_meta = pq.read_metadata(PARQUET_FILE)
 ALL_COLS = [col.name for col in parquet_meta.schema]
 
-# Features ahora incluyen establecimiento y material porque son inputs al modelo de cluster
-# Excluir target, fecha original, cluster label (ya que filtramos por él)
-# y otras columnas no predictivas o que causarían fugas.
 FEATURES_COLS = [
     col for col in ALL_COLS
     if col not in [TARGET_VARIABLE, DATE_COL, CLUSTER_COL, 'last_sale_week'] 
 ]
 
-# Identificar features categóricas y numéricas
-# ¡IMPORTANTE! establecimiento y material AHORA son categóricas para el modelo de cluster
-CATEGORICAL_FEATURES = ['establecimiento', 'material', 'cluster_label'] # 'cluster_label' aquí es solo para referencia, no se usará como feature directa en el modelo cluster
-# Asegurarnos de que solo las que existen en FEATURES_COLS se usen
-CATEGORICAL_FEATURES_FOR_MODEL = [f for f in ['establecimiento', 'material'] if f in FEATURES_COLS] 
-# Añade otras si las tienes y son categóricas (ej. 'has_promo' si prefieres tratarla así)
-# Forzamos las binarias/flags a ser numéricas para simplificar, RF las maneja bien.
+CATEGORICAL_FEATURES = ['establecimiento', 'material', 'cluster_label']
+CATEGORICAL_FEATURES_FOR_MODEL = [f for f in ['establecimiento', 'material'] if f in FEATURES_COLS]
 NUMERICAL_FEATURES = [col for col in FEATURES_COLS if col not in CATEGORICAL_FEATURES_FOR_MODEL]
 
-
-# --- 2. Funciones Auxiliares (Iguales que antes) ---
-
 def calculate_mase(y_true_train, y_true_test, y_pred_test):
-    """Calcula el Mean Absolute Scaled Error (MASE)."""
-    # Asegurar que trabajamos con numpy arrays planos
     y_true_train = np.array(y_true_train).flatten()
     y_true_test = np.array(y_true_test).flatten()
     y_pred_test = np.array(y_pred_test).flatten()
 
     if len(y_true_train) < 2:
-        return np.nan # No se puede calcular el error naive
+        return np.nan
 
-    # Error absoluto de la predicción naive (valor anterior) en el conjunto de entrenamiento
-    # Calculado globalmente sobre el y_train del cluster
     naive_forecast_error_train = np.mean(np.abs(np.diff(y_true_train)))
 
-    if naive_forecast_error_train < 1e-9: # Comparación segura con cero
-         # Si el error naive es 0 (serie constante en train), MASE no está definido o es infinito.
+    if naive_forecast_error_train < 1e-9:
          model_mae_test = mean_absolute_error(y_true_test, y_pred_test)
          return np.inf if model_mae_test > 1e-9 else 0.0
 
-    # Error absoluto del modelo en el conjunto de test
     model_mae_test = mean_absolute_error(y_true_test, y_pred_test)
 
     return model_mae_test / naive_forecast_error_train
 
 
 def evaluate_model(y_true_train, y_true_test, y_pred_test, label="Cluster"):
-    """Calcula un diccionario de métricas agregadas."""
     metrics = {
         f'{label}_mae': mean_absolute_error(y_true_test, y_pred_test),
         f'{label}_rmse': np.sqrt(mean_squared_error(y_true_test, y_pred_test)),
-        # Calcular MAPE solo si no hay ceros absolutos en y_true_test para evitar inf
         f'{label}_mape': mean_absolute_percentage_error(y_true_test, y_pred_test) if np.all(np.abs(y_true_test) > 1e-9) else np.nan,
         f'{label}_r2': r2_score(y_true_test, y_pred_test),
         f'{label}_mase': calculate_mase(y_true_train, y_true_test, y_pred_test)
-        # Añade aquí TAPE, ROSE, MAS si tienes sus definiciones
     }
-    # Reemplazar infinitos en MAPE si ocurren (pueden pasar si y_true_test tiene ceros y no se filtró antes)
     mape_key = f'{label}_mape'
     if mape_key in metrics and np.isinf(metrics[mape_key]):
-         metrics[mape_key] = np.nan # O un valor grande representativo
+         metrics[mape_key] = np.nan
     return metrics
 
 
 def plot_predictions(dates_test, y_true_test, y_pred_test, estab, material, cluster_id, filepath):
-    """Genera y guarda un gráfico de predicciones vs reales para UNA serie."""
     plt.figure(figsize=(15, 6))
     plt.plot(dates_test, y_true_test, label='Real', marker='.', linestyle='-')
     plt.plot(dates_test, y_pred_test, label=f'Predicción (Cluster {cluster_id})', marker='x', linestyle='--')
@@ -116,11 +91,36 @@ def plot_predictions(dates_test, y_true_test, y_pred_test, estab, material, clus
     plt.grid(True)
     plt.tight_layout()
     plt.savefig(filepath)
-    plt.close() # Cierra la figura para liberar memoria
+    plt.close()
 
-# --- 3. Identificar Clusters Únicos ---
 try:
     print(f"Leyendo columna de clusters '{CLUSTER_COL}' del archivo: {PARQUET_FILE}")
+    pf = pq.ParquetFile(PARQUET_FILE)
+    cluster_labels_df = pf.read(columns=[CLUSTER_COL]).to_pandas()
+    unique_clusters = cluster_labels_df[CLUSTER_COL].unique()
+    unique_clusters = [c for c in unique_clusters if pd.notna(c)] 
+    print(f"Encontrados {len(unique_clusters)} clusters únicos.")
+    del cluster_labels_df
+    gc.collect()
+except Exception as e:
+    print(f"Error al leer la columna de clusters del Parquet: {e}")
+    exit()
+
+all_cluster_metrics = []
+header_preds = SERIES_ID_COLS + [DATE_COL, 'actual_volume', 'predicted_volume', CLUSTER_COL]
+pd.DataFrame(columns=header_preds).to_csv(PREDICTIONS_FILE, index=False)
+
+N_SPLITS_CV = 5 
+N_ITER_HPT = 10 
+SCORING_METRIC_HPT = 'neg_mean_absolute_error' 
+
+param_dist = {
+    'n_estimators': [50, 100, 200, 300],
+    'max_depth': [None, 10, 20, 30],
+    'min_samples_split': [2, 5, 10],
+    'min_samples_leaf': [1, 3, 5],
+    'max_features': ['sqrt', 'log2', 0.7, 1.0] 
+}
     pf = pq.ParquetFile(PARQUET_FILE)
     # Leer solo la columna del cluster para eficiencia
     cluster_labels_df = pf.read(columns=[CLUSTER_COL]).to_pandas()
